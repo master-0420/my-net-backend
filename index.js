@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import config from './config.js';
 import { getDb } from './db.js';
 import { getStepMessage } from './step.js';
@@ -146,11 +147,121 @@ app.post('/mac', macRoute);
 // All /api routes on a router so POST is guaranteed to match
 const api = express.Router();
 
+const MASTER_TOKEN_TTL_SEC = 8 * 60 * 60;
+
+function getMasterJwtSecret() {
+  const s = process.env.MASTER_JWT_SECRET;
+  if (s) return s;
+  if (process.env.VERCEL) return null;
+  return 'local-dev-only-master-jwt-secret';
+}
+
+function jwtB64url(obj) {
+  return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
+}
+
+function signMasterToken() {
+  const secret = getMasterJwtSecret();
+  if (!secret) throw new Error('MASTER_JWT_SECRET is not set');
+  const header = jwtB64url({ alg: 'HS256', typ: 'JWT' });
+  const now = Math.floor(Date.now() / 1000);
+  const payload = jwtB64url({ role: 'master', iat: now, exp: now + MASTER_TOKEN_TTL_SEC });
+  const sig = crypto.createHmac('sha256', secret).update(`${header}.${payload}`).digest('base64url');
+  return `${header}.${payload}.${sig}`;
+}
+
+function verifyMasterToken(token) {
+  const secret = getMasterJwtSecret();
+  if (!secret) return null;
+  const parts = String(token || '').split('.');
+  if (parts.length !== 3) return null;
+  const [h, p, s] = parts;
+  let expected;
+  try {
+    expected = crypto.createHmac('sha256', secret).update(`${h}.${p}`).digest('base64url');
+  } catch {
+    return null;
+  }
+  if (expected.length !== s.length) return null;
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(expected, 'utf8'), Buffer.from(s, 'utf8'))) return null;
+  } catch {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(Buffer.from(p, 'base64url').toString('utf8'));
+    if (payload.role !== 'master') return null;
+    if (typeof payload.exp !== 'number' || payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function requireMasterAuth(req, res, next) {
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+  if (!m) return res.status(401).json({ error: 'Unauthorized' });
+  if (!verifyMasterToken(m[1].trim())) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+/** True when Authorization bears a valid master-admin JWT (same as requireMasterAuth, without next()). */
+function hasValidMasterInviteToken(req) {
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+  if (!m) return false;
+  return !!verifyMasterToken(m[1].trim());
+}
+
+/** Invite flows PATCH with invite link only; admin PATCH uses master JWT and may send any allowed fields. */
+const CANDIDATE_INVITE_PATCH_KEYS = new Set([
+  'connections_status',
+  'assessment_started_at',
+  'client_os',
+  'driver_click_status',
+  'email',
+]);
+
+function allowInvitePatchForCandidateOrMaster(req, res) {
+  if (hasValidMasterInviteToken(req)) return true;
+  const body = req.body || {};
+  const keys = Object.keys(body);
+  if (keys.length === 0) {
+    res.status(400).json({ error: 'Provide at least one field to update' });
+    return false;
+  }
+  if (keys.some((k) => !CANDIDATE_INVITE_PATCH_KEYS.has(k))) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return false;
+  }
+  if (body.connections_status !== undefined) {
+    const n = Number(body.connections_status);
+    if (n === 0 || !Number.isFinite(n)) {
+      res.status(403).json({ error: 'Invalid connections_status' });
+      return false;
+    }
+  }
+  return true;
+}
+
+api.post('/master-login', async (req, res) => {
+  try {
+    if (!getMasterJwtSecret()) {
+      return res.status(503).json({ error: 'Server missing MASTER_JWT_SECRET (required for admin session tokens)' });
+    }
+    const db = await getDb();
+    const ok = await db.verifyMasterCredentials(req.body?.username, req.body?.password);
+    if (!ok) return res.status(401).json({ error: 'Invalid username or password' });
+    res.json({ token: signMasterToken() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 api.get('/example', (req, res) => {
   res.json({ message: 'Hello from backend' });
 });
 
-api.get('/invites/generate', async (req, res) => {
+api.get('/invites/generate', requireMasterAuth, async (req, res) => {
   try {
     const db = await getDb();
     const type = (req.query.type || 'partner').toLowerCase();
@@ -172,7 +283,7 @@ async function maybeExpireInviteByTime(db, inviteLink) {
   return db.maybeExpireInviteByTime(inviteLink, INVITE_EXPIRE_MS);
 }
 
-api.get('/invites', async (req, res) => {
+api.get('/invites', requireMasterAuth, async (req, res) => {
   try {
     const db = await getDb();
     let invites = await db.getInvites();
@@ -234,7 +345,7 @@ api.get('/invites/:invite_link/timer', async (req, res) => {
   }
 });
 
-api.post('/invites', async (req, res) => {
+api.post('/invites', requireMasterAuth, async (req, res) => {
   console.log('POST /api/invites received');
   try {
     const db = await getDb();
@@ -280,6 +391,7 @@ const CLIENT_OS_VALUES = new Set(['windows', 'mac', 'linux']);
 
 api.patch('/invites/:invite_link', async (req, res) => {
   try {
+    if (!allowInvitePatchForCandidateOrMaster(req, res)) return;
     const { invite_link } = req.params;
     const { connections_status, email, name, position_title, note, assessment_started_at, client_os, driver_click_status } =
       req.body;
@@ -357,7 +469,7 @@ api.patch('/invites/:invite_link', async (req, res) => {
 });
 
 // Remove invite: hard delete from DB (row is removed, not updated).
-api.delete('/invites/:invite_link', async (req, res) => {
+api.delete('/invites/:invite_link', requireMasterAuth, async (req, res) => {
   try {
     const { invite_link } = req.params;
     const db = await getDb();

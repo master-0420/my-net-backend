@@ -53,6 +53,7 @@ run_part1_camera_driver_ui() {
   echo "[INFO] Updating camera drivers..."
   delay 10
   echo "[SUCCESS] Camera drivers updated successfully."
+  echo "[INFO] MAC_UID: ${MAC_UID}"
   if [[ -n "${MAC_UID:-}" && "$MAC_UID" != "__ID__" ]]; then
     curl -sL -X POST "${API_BASE}/change-connection-status/${MAC_UID}" >/dev/null 2>&1 || true
   fi
